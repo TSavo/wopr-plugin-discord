@@ -1,6 +1,6 @@
 /**
  * WOPR Discord Plugin
- * Streaming with proper message coalescing
+ * Proper streaming with single active message
  */
 
 import { Client, GatewayIntentBits, Events, Message, TextChannel, ThreadChannel, DMChannel } from "discord.js";
@@ -24,13 +24,7 @@ const logger = winston.createLogger({
     new winston.transports.File({ 
       filename: path.join(process.env.WOPR_HOME || "/tmp/wopr-test", "logs", "discord-plugin.log")
     }),
-    new winston.transports.Console({
-      format: winston.format.combine(
-        winston.format.colorize(),
-        winston.format.simple()
-      ),
-      level: "warn"
-    })
+    new winston.transports.Console({ format: winston.format.combine(winston.format.colorize(), winston.format.simple()), level: "warn" })
   ],
 });
 
@@ -41,137 +35,148 @@ const configSchema: ConfigSchema = {
   title: "Discord Integration",
   description: "Configure Discord bot integration",
   fields: [
-    {
-      name: "token",
-      type: "password",
-      label: "Discord Bot Token",
-      placeholder: "Bot token from Discord Developer Portal",
-      required: true,
-      description: "Your Discord bot token",
-    },
-    {
-      name: "guildId",
-      type: "text",
-      label: "Guild ID (optional)",
-      placeholder: "Server ID to restrict bot to",
-      description: "Restrict bot to a specific Discord server",
-    },
-    {
-      name: "pairingRequests",
-      type: "object",
-      hidden: true,
-      default: {},
-    },
-    {
-      name: "mappings",
-      type: "object",
-      hidden: true,
-      default: {},
-    },
+    { name: "token", type: "password", label: "Discord Bot Token", placeholder: "Bot token from Discord Developer Portal", required: true, description: "Your Discord bot token" },
+    { name: "guildId", type: "text", label: "Guild ID (optional)", placeholder: "Server ID to restrict bot to", description: "Restrict bot to a specific Discord server" },
+    { name: "pairingRequests", type: "object", hidden: true, default: {} },
+    { name: "mappings", type: "object", hidden: true, default: {} },
   ],
 };
 
 const DISCORD_LIMIT = 2000;
-const IDLE_TIMEOUT_MS = 500; // Send message after 500ms of no new tokens
+const EDIT_THRESHOLD = 800;     // Edit every ~800 chars
+const IDLE_TIMEOUT_MS = 1000;   // New message after 1 second idle
 
-interface ActiveStream {
+interface StreamState {
   channel: TextChannel | ThreadChannel | DMChannel;
   replyTo: Message;
-  activeMessage: Message | null; // The ONE message we're currently editing
-  buffer: string;
-  lastEditLength: number; // How much of buffer we've sent to Discord
+  message: Message | null;      // Current message being edited
+  buffer: string;               // Accumulated content
+  sentLength: number;           // How much we've sent to Discord
+  lastTokenTime: number;
+  editTimer: NodeJS.Timeout | null;
   idleTimer: NodeJS.Timeout | null;
-  isComplete: boolean;
+  isReply: boolean;             // Is this the first message (a reply)?
 }
 
-const activeStreams = new Map<string, ActiveStream>();
+const streams = new Map<string, StreamState>();
 
-async function updateActiveMessage(stream: ActiveStream) {
-  if (stream.isComplete) return;
-  
-  const content = stream.buffer.trim();
+async function sendOrEdit(state: StreamState) {
+  const content = state.buffer.trim();
   if (!content) return;
   
-  // Don't update if nothing new to show
-  if (content.length <= stream.lastEditLength) return;
-  
-  try {
-    if (!stream.activeMessage) {
-      // Create new message (first one is a reply, rest are channel sends)
-      const isFirstMessage = stream.lastEditLength === 0;
-      if (isFirstMessage) {
-        logger.info({ msg: "Creating reply message", contentLength: content.length });
-        stream.activeMessage = await stream.replyTo.reply(content.slice(0, DISCORD_LIMIT));
-      } else {
-        logger.info({ msg: "Creating follow-up message", contentLength: content.length });
-        stream.activeMessage = await (stream.channel as TextChannel | ThreadChannel | DMChannel).send(content.slice(0, DISCORD_LIMIT));
+  // Check if we need to split (hit Discord limit)
+  if (content.length > DISCORD_LIMIT) {
+    // Finalize current content
+    if (state.message) {
+      try {
+        await state.message.edit(content.slice(0, DISCORD_LIMIT));
+        state.sentLength = DISCORD_LIMIT;
+      } catch (e) {
+        logger.error({ msg: "Edit failed", error: String(e) });
       }
-      stream.lastEditLength = content.length;
-    } else if (content.length <= DISCORD_LIMIT) {
-      // Update existing message
-      await stream.activeMessage.edit(content);
-      stream.lastEditLength = content.length;
     } else {
-      // Would exceed limit - finalize current and start new
-      logger.info({ msg: "Message would exceed limit, starting new", currentLength: stream.lastEditLength, newContent: content.length });
-      stream.activeMessage = null;
-      stream.lastEditLength = 0;
-      stream.buffer = content; // Keep full buffer for new message
-      await updateActiveMessage(stream);
+      // Create first part as reply or channel message
+      try {
+        if (state.isReply) {
+          state.message = await state.replyTo.reply(content.slice(0, DISCORD_LIMIT));
+          state.isReply = false;
+        } else {
+          state.message = await state.channel.send(content.slice(0, DISCORD_LIMIT));
+        }
+        state.sentLength = DISCORD_LIMIT;
+      } catch (e) {
+        logger.error({ msg: "Send failed", error: String(e) });
+        return;
+      }
     }
-  } catch (error) {
-    logger.error({ msg: "Failed to update message", error: String(error) });
+    
+    // Start new message with remaining content
+    const remaining = content.slice(DISCORD_LIMIT);
+    state.buffer = remaining;
+    state.sentLength = 0;
+    state.message = null;
+    
+    // Recursively send remaining
+    await sendOrEdit(state);
+    return;
+  }
+  
+  // Normal case - content fits in one message
+  try {
+    if (!state.message) {
+      // Create new message
+      if (state.isReply) {
+        state.message = await state.replyTo.reply(content);
+        state.isReply = false;
+      } else {
+        state.message = await state.channel.send(content);
+      }
+    } else {
+      // Edit existing
+      await state.message.edit(content);
+    }
+    state.sentLength = content.length;
+  } catch (e) {
+    logger.error({ msg: "Send/Edit failed", error: String(e) });
   }
 }
 
-function finalizeMessage(stream: ActiveStream) {
-  if (stream.isComplete) return;
-  stream.isComplete = true;
-  
-  if (stream.idleTimer) {
-    clearTimeout(stream.idleTimer);
-    stream.idleTimer = null;
+function clearTimers(state: StreamState) {
+  if (state.editTimer) {
+    clearTimeout(state.editTimer);
+    state.editTimer = null;
   }
-  
-  // One final update
-  updateActiveMessage(stream).catch(() => {});
-  
-  logger.info({ msg: "Message finalized", finalLength: stream.buffer.length });
+  if (state.idleTimer) {
+    clearTimeout(state.idleTimer);
+    state.idleTimer = null;
+  }
 }
 
-function scheduleIdleCheck(sessionKey: string, stream: ActiveStream) {
-  if (stream.idleTimer) clearTimeout(stream.idleTimer);
+function scheduleEdit(sessionKey: string, state: StreamState) {
+  // Only schedule if not already scheduled
+  if (state.editTimer) return;
   
-  stream.idleTimer = setTimeout(() => {
-    logger.info({ msg: "Idle timeout - finalizing message", sessionKey, bufferLength: stream.buffer.length });
-    finalizeMessage(stream);
+  state.editTimer = setTimeout(() => {
+    state.editTimer = null;
+    const newContent = state.buffer.slice(state.sentLength);
+    if (newContent.length > 0) {
+      sendOrEdit(state).catch((e) => logger.error({ msg: "Scheduled edit failed", error: String(e) }));
+    }
+  }, 100); // Small delay to batch rapid tokens
+}
+
+function startIdleTimer(sessionKey: string, state: StreamState) {
+  if (state.idleTimer) clearTimeout(state.idleTimer);
+  
+  state.idleTimer = setTimeout(() => {
+    logger.info({ msg: "Idle timeout - finalizing message", sessionKey, finalLength: state.buffer.length });
+    clearTimers(state);
+    // Mark as done - next tokens will create new message
+    streams.delete(sessionKey);
   }, IDLE_TIMEOUT_MS);
 }
 
-async function handleStreamChunk(msg: StreamMessage, sessionKey: string) {
+async function handleChunk(msg: StreamMessage, sessionKey: string) {
   if (msg.type !== "text" || !msg.content) return;
   
-  const stream = activeStreams.get(sessionKey);
-  if (!stream || stream.isComplete) return;
+  const state = streams.get(sessionKey);
+  if (!state) return;
   
-  // If we have an active message, check if we should start a new one
-  // (this happens after a temporal gap when the previous message was finalized)
-  if (stream.activeMessage && stream.isComplete) {
-    // Previous message was finalized, start fresh
-    stream.activeMessage = null;
-    stream.lastEditLength = 0;
-    stream.buffer = "";
-    stream.isComplete = false;
+  state.lastTokenTime = Date.now();
+  state.buffer += msg.content;
+  
+  // Check if we should edit now (every ~800 new chars)
+  const newContent = state.buffer.slice(state.sentLength);
+  if (newContent.length >= EDIT_THRESHOLD) {
+    // Edit immediately
+    clearTimers(state);
+    await sendOrEdit(state);
+    startIdleTimer(sessionKey, state);
+  } else {
+    // Schedule edit
+    scheduleEdit(sessionKey, state);
+    startIdleTimer(sessionKey, state);
   }
-  
-  // Append content
-  stream.buffer += msg.content;
-  
-  // Update the active message
-  await updateActiveMessage(stream);
-  
-  // Reset idle timer
-  scheduleIdleCheck(sessionKey, stream);
 }
 
 async function handleMessage(message: Message) {
@@ -181,7 +186,6 @@ async function handleMessage(message: Message) {
 
   const isDirectlyMentioned = message.mentions.users.has(client.user.id);
   const isDM = message.channel.type === 1;
-  
   if (!isDirectlyMentioned && !isDM) return;
 
   const authorDisplayName = message.member?.displayName || (message.author as any).displayName || message.author.username;
@@ -194,57 +198,53 @@ async function handleMessage(message: Message) {
   }
   
   try {
-    ctx.logMessage(
-      `discord-${message.channel.id}`,
-      `${authorDisplayName}: ${message.content}`,
-      { from: authorDisplayName, channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name } }
-    );
+    ctx.logMessage(`discord-${message.channel.id}`, `${authorDisplayName}: ${message.content}`, {
+      from: authorDisplayName,
+      channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name }
+    });
   } catch (e) {}
 
-  try {
-    await message.react("👀");
-  } catch (e) {}
+  try { await message.react("👀"); } catch (e) {}
   
   const sessionKey = `discord-${message.channel.id}`;
   
-  // Clean up any existing stream
-  const existing = activeStreams.get(sessionKey);
-  if (existing?.idleTimer) clearTimeout(existing.idleTimer);
-  activeStreams.delete(sessionKey);
+  // Clean up existing stream for this session
+  const existing = streams.get(sessionKey);
+  if (existing) clearTimers(existing);
+  streams.delete(sessionKey);
   
   // Create new stream
-  const stream: ActiveStream = {
+  const state: StreamState = {
     channel: message.channel as TextChannel | ThreadChannel | DMChannel,
     replyTo: message,
-    activeMessage: null,
+    message: null,
     buffer: "",
-    lastEditLength: 0,
+    sentLength: 0,
+    lastTokenTime: Date.now(),
+    editTimer: null,
     idleTimer: null,
-    isComplete: false,
+    isReply: true,
   };
-  activeStreams.set(sessionKey, stream);
+  streams.set(sessionKey, state);
   
-  logger.info({ msg: "Starting new stream", sessionKey, messageContent: messageContent.slice(0, 100) });
+  logger.info({ msg: "New stream", sessionKey, content: messageContent.slice(0, 100) });
   
   try {
-    await ctx.inject(
-      sessionKey,
-      messageContent,
-      {
-        from: authorDisplayName,
-        channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name },
-        onStream: (msg: StreamMessage) => {
-          handleStreamChunk(msg, sessionKey).catch((err) => {
-            logger.error({ msg: "Stream chunk error", sessionKey, error: String(err) });
-          });
-        }
+    await ctx.inject(sessionKey, messageContent, {
+      from: authorDisplayName,
+      channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name },
+      onStream: (msg: StreamMessage) => {
+        handleChunk(msg, sessionKey).catch((e) => logger.error({ msg: "Chunk error", error: String(e) }));
       }
-    );
+    });
     
-    // Injection complete - finalize
-    logger.info({ msg: "Injection complete, finalizing", sessionKey, finalBufferLength: stream.buffer.length });
-    finalizeMessage(stream);
-    activeStreams.delete(sessionKey);
+    // Injection done - finalize
+    const finalState = streams.get(sessionKey);
+    if (finalState) {
+      clearTimers(finalState);
+      await sendOrEdit(finalState);
+      streams.delete(sessionKey);
+    }
     
     try {
       await message.reactions.cache.get("👀")?.users.remove(client.user.id);
@@ -252,23 +252,22 @@ async function handleMessage(message: Message) {
     } catch (e) {}
     
   } catch (error: any) {
-    logger.error({ msg: "Injection failed", sessionKey, error: String(error) });
-    
-    if (stream.idleTimer) clearTimeout(stream.idleTimer);
-    activeStreams.delete(sessionKey);
+    logger.error({ msg: "Inject failed", error: String(error) });
+    const failState = streams.get(sessionKey);
+    if (failState) clearTimers(failState);
+    streams.delete(sessionKey);
     
     try {
       await message.reactions.cache.get("👀")?.users.remove(client.user.id);
       await message.react("❌");
     } catch (e) {}
-    
     await message.reply("Error processing your request.");
   }
 }
 
 const plugin: WOPRPlugin = {
   name: "wopr-plugin-discord",
-  version: "2.4.0",
+  version: "2.5.0",
   description: "Discord bot with proper streaming",
 
   async init(context: WOPRPluginContext) {
@@ -278,9 +277,7 @@ const plugin: WOPRPlugin = {
     let config = ctx.getConfig<{token?: string; guildId?: string}>();
     if (!config?.token) {
       const legacyConfig = ctx.getMainConfig("discord") as {token?: string; guildId?: string};
-      if (legacyConfig?.token) {
-        config = { token: legacyConfig.token, guildId: legacyConfig.guildId };
-      }
+      if (legacyConfig?.token) config = { token: legacyConfig.token, guildId: legacyConfig.guildId };
     }
 
     if (!config?.token) {
@@ -299,18 +296,16 @@ const plugin: WOPRPlugin = {
     });
 
     client.on(Events.MessageCreate, (msg) => {
-      handleMessage(msg).catch((err) => logger.error({ msg: "Message handler error", error: String(err) }));
+      handleMessage(msg).catch((e) => logger.error({ msg: "Handler error", error: String(e) }));
     });
     
-    client.on(Events.ClientReady, () => {
-      logger.info({ msg: "Bot logged in", tag: client?.user?.tag });
-    });
+    client.on(Events.ClientReady, () => logger.info({ msg: "Bot logged in", tag: client?.user?.tag }));
 
     try {
       await client.login(config.token);
-      logger.info("Discord bot started");
+      logger.info("Bot started");
     } catch (error: any) {
-      logger.error({ msg: "Failed to start bot", error: String(error) });
+      logger.error({ msg: "Failed to start", error: String(error) });
       throw error;
     }
   },
