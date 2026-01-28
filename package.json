@@ -10,12 +10,21 @@
     "dev": "tsc --watch",
     "prepublishOnly": "npm run build"
   },
-  "keywords": ["wopr", "plugin", "discord", "bot", "ai"],
+  "keywords": [
+    "wopr",
+    "plugin",
+    "discord",
+    "bot",
+    "ai"
+  ],
   "author": "WOPR",
   "license": "MIT",
-  "dependencies": { "discord.js": "^14.14.1" },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "winston": "^3.19.0"
+  },
   "devDependencies": {
-    "typescript": "^5.3.0",
-    "@types/node": "^20.0.0"
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0"
   }
 }
