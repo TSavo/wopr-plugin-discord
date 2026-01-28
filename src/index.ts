@@ -91,15 +91,15 @@ class DiscordMessage {
     return false;
   }
   
-  async finalize(): Promise<void> {
+  async finalize(channel: TextChannel | ThreadChannel | DMChannel, replyTo: Message): Promise<void> {
     if (this.isFinalized || !this.buffer.trim()) return;
     const content = this.buffer.trim();
     if (this.discordMsg) {
       await this.discordMsg.edit(content);
     } else {
       this.discordMsg = this.isReply 
-        ? await (this.discordMsg as any)?.channel?.send?.(content) || await (this as any).channel?.send?.(content)
-        : await (this as any).channel?.send?.(content);
+        ? await replyTo.reply(content)
+        : await channel.send(content);
     }
     this.isFinalized = true;
   }
@@ -134,7 +134,7 @@ async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: 
   // Check for idle gap - finalize current and start new message
   if (timeSinceLast > IDLE_SPLIT_MS && state.currentMsg.buffer.length > 0) {
     logger.info({ msg: "Idle gap detected", sessionKey, gapMs: timeSinceLast });
-    await state.currentMsg.finalize();
+    await state.currentMsg.finalize(state.channel, state.replyTo);
     const newMsg = new DiscordMessage(false); // Follow-ups aren't replies
     state.messages.push(state.currentMsg);
     state.currentMsg = newMsg;
@@ -222,7 +222,7 @@ async function handleMessage(message: Message) {
     });
     
     // Finalize last message
-    await state.currentMsg.finalize();
+    await state.currentMsg.finalize(state.channel, state.replyTo);
     streams.delete(sessionKey);
     
     try { await message.reactions.cache.get("👀")?.users.remove(client.user.id); await message.react("✅"); } catch (e) {}
