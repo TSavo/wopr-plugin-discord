@@ -24,6 +24,20 @@ export interface StreamMessage {
   content: string;
 }
 
+export interface ChannelInfo {
+  type: string;
+  id: string;
+  name?: string;
+}
+
+export interface InjectOptions {
+  silent?: boolean;
+  onStream?: (msg: StreamMessage) => void;
+  from?: string;
+  channel?: ChannelInfo;
+  images?: string[];
+}
+
 export interface PluginLogger {
   info: (...args: any[]) => void;
   warn: (...args: any[]) => void;
@@ -31,7 +45,7 @@ export interface PluginLogger {
 }
 
 export interface WOPRPluginContext {
-  inject: (session: string, message: string, onStream?: (msg: StreamMessage) => void) => Promise<string>;
+  inject: (session: string, message: string, options?: InjectOptions) => Promise<string>;
   injectPeer: (peer: string, session: string, message: string) => Promise<string>;
   getIdentity: () => { publicKey: string; shortId: string; encryptPub: string };
   getSessions: () => string[];

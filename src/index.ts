@@ -53,9 +53,6 @@ async function handleMessage(message: Message) {
   
   // Ignore @everyone and @here mentions (the bot is included but not directly mentioned)
   const isDirectlyMentioned = message.mentions.users.has(client.user.id);
-  const isRoleMentioned = message.mentions.roles.size > 0;
-  const hasEveryoneMention = message.content.includes("@everyone");
-  const hasHereMention = message.content.includes("@here");
   
   // Only respond to direct mentions or DMs, not @everyone/@here
   const shouldRespond = isDirectlyMentioned || isDM;
@@ -63,7 +60,17 @@ async function handleMessage(message: Message) {
   // Additional check: if it's just @everyone/@here without a direct mention, ignore
   if (!shouldRespond) return;
 
-  const resolvedContent = message.content;
+  // Get author info for context tracking
+  const authorName = message.author.username;
+  const authorDisplayName = message.member?.displayName || message.author.displayName || authorName;
+  
+  // Clean up message content by removing bot mention
+  let messageContent = message.content;
+  if (client.user) {
+    const botMention = `<@${client.user.id}>`;
+    const botNicknameMention = `<@!${client.user.id}>`;
+    messageContent = messageContent.replace(botNicknameMention, "").replace(botMention, "").trim();
+  }
   
   // Add eyes reaction to show we're processing
   try {
@@ -73,7 +80,15 @@ async function handleMessage(message: Message) {
   }
   
   try {
-    const response = await ctx.inject(`discord-${message.channel.id}`, resolvedContent);
+    // Pass author info so context/conversation history works properly
+    const response = await ctx.inject(
+      `discord-${message.channel.id}`,
+      messageContent,
+      {
+        from: authorDisplayName,
+        channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name },
+      }
+    );
     
     // Remove eyes and add checkmark when done
     try {
@@ -103,7 +118,7 @@ async function handleMessage(message: Message) {
 
 const plugin: WOPRPlugin = {
   name: "wopr-plugin-discord",
-  version: "2.0.7",
+  version: "2.0.8",
   description: "Discord bot integration for WOPR",
 
   async init(context: WOPRPluginContext) {
