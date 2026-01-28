@@ -3,22 +3,13 @@
  * Talk to your WOPR sessions via Discord.
  */
 
-import { Client, GatewayIntentBits, Events, Message, TextChannel, DMChannel } from "discord.js";
-import { writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
-import type { WOPRPlugin, WOPRPluginContext } from "wopr";
+import { Client, GatewayIntentBits, Events, Message } from "discord.js";
+import type { WOPRPlugin, WOPRPluginContext, ConfigSchema } from "./types.js";
 
 let client: Client | null = null;
 let ctx: WOPRPluginContext | null = null;
 
-interface ConfigSchema {
-  token?: string;
-  guildId?: string;
-  pairingRequests?: Record<string, any>;
-  mappings?: Record<string, any>;
-}
-
-const configSchema = {
+const configSchema: ConfigSchema = {
   title: "Discord Integration",
   description: "Configure Discord bot integration",
   fields: [
@@ -111,18 +102,16 @@ const plugin: WOPRPlugin = {
     ctx.log.info("Discord config schema registered");
 
     // Try plugin-specific config first, then fall back to legacy
-    let config = ctx.getConfig<ConfigSchema>();
+    let config = ctx.getConfig<{token?: string; guildId?: string}>();
     ctx.log.info("Plugin config:", JSON.stringify(config));
 
     if (!config?.token) {
-      const legacyConfig = ctx.getMainConfig("discord") as ConfigSchema;
+      const legacyConfig = ctx.getMainConfig("discord") as {token?: string; guildId?: string};
       ctx.log.info("Legacy config:", JSON.stringify(legacyConfig));
       if (legacyConfig?.token) {
         config = { 
           token: legacyConfig.token, 
           guildId: legacyConfig.guildId,
-          pairingRequests: config?.pairingRequests,
-          mappings: config?.mappings
         };
         ctx.log.info("Using legacy config location");
       }
@@ -146,7 +135,7 @@ const plugin: WOPRPlugin = {
     });
 
     client.on(Events.MessageCreate, handleMessage);
-    client.on(Events.Ready, () => {
+    client.on(Events.ClientReady, () => {
       ctx!.log.info(`Discord bot logged in as ${client!.user?.tag}`);
     });
 
