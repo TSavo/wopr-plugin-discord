@@ -38,6 +38,11 @@ export interface InjectOptions {
   images?: string[];
 }
 
+export interface LogMessageOptions {
+  from?: string;
+  channel?: ChannelInfo;
+}
+
 export interface PluginLogger {
   info: (...args: any[]) => void;
   warn: (...args: any[]) => void;
@@ -46,6 +51,7 @@ export interface PluginLogger {
 
 export interface WOPRPluginContext {
   inject: (session: string, message: string, options?: InjectOptions) => Promise<string>;
+  logMessage: (session: string, message: string, options?: LogMessageOptions) => void;
   injectPeer: (peer: string, session: string, message: string) => Promise<string>;
   getIdentity: () => { publicKey: string; shortId: string; encryptPub: string };
   getSessions: () => string[];
