@@ -100,9 +100,11 @@ async function updateDiscordMessage(state: StreamState) {
 }
 
 function scheduleUpdate(sessionKey: string, state: StreamState) {
-  if (state.flushTimer) clearTimeout(state.flushTimer);
+  // Only schedule if not already scheduled - prevents timer reset on every token
+  if (state.flushTimer) return;
   
   state.flushTimer = setTimeout(() => {
+    state.flushTimer = null;
     updateDiscordMessage(state).catch(() => {});
   }, EDIT_COALESCE_MS);
 }
