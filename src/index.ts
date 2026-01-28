@@ -44,78 +44,106 @@ const configSchema: ConfigSchema = {
 };
 
 const DISCORD_LIMIT = 2000;
-const COALESCE_CHARS = 500;  // Update Discord message every 500 chars
-const COALESCE_MS = 300;     // Or after 300ms idle
+const EDIT_COALESCE_CHARS = 800;  // Edit every 800 chars
+const EDIT_COALESCE_MS = 500;     // Or every 500ms
 
 // Track streaming state per session
 interface StreamState {
   channel: Message["channel"];
   replyTo: Message;
-  thinkingMsg: Message | null;
-  responseMsg: Message | null;
+  message: Message | null;  // Single message for both thinking and response
   buffer: string;
+  displayedLength: number;  // How much we've already sent to Discord
   mode: "thinking" | "response";
-  lastUpdate: number;
-  timeout: NodeJS.Timeout | null;
+  flushTimer: NodeJS.Timeout | null;
+  isComplete: boolean;
 }
 
 const streams = new Map<string, StreamState>();
 
-async function flushState(state: StreamState, force: boolean = false) {
+async function updateDiscordMessage(state: StreamState) {
   if (!state.buffer.trim()) return;
   
-  const text = state.buffer.trim();
-  const prefix = "";
-  const fullText = prefix + text;
+  const fullText = state.buffer.trim();
   
-  // Check if we need to split (Discord 2000 char limit)
-  if (fullText.length > DISCORD_LIMIT) {
-    // Send current message and start new one
-    const chunks = splitMessage(text, DISCORD_LIMIT - prefix.length);
-    
-    for (let i = 0; i < chunks.length; i++) {
-      const chunkText = prefix + chunks[i];
+  // Only update if we have new content to show
+  if (fullText.length <= state.displayedLength) return;
+  
+  // Get just the new portion for appending
+  const newContent = fullText.slice(state.displayedLength);
+  
+  try {
+    if (!state.message) {
+      // First message - create it
+      const chunk = fullText.slice(0, DISCORD_LIMIT);
+      state.message = await state.replyTo.reply(chunk);
+      state.displayedLength = chunk.length;
+    } else if (fullText.length <= DISCORD_LIMIT) {
+      // Still fits in one message - edit it
+      await state.message.edit(fullText);
+      state.displayedLength = fullText.length;
+    } else {
+      // Need to split into multiple messages
+      // Send remaining content as new messages
+      let remaining = fullText.slice(state.displayedLength);
       
-      if (state.mode === "thinking") {
-        if (state.thinkingMsg && i === 0) {
-          await state.thinkingMsg.edit(chunkText);
-        } else {
-          state.thinkingMsg = await sendToChannel(state.channel, chunkText) || state.thinkingMsg;
-        }
-      } else {
-        if (state.responseMsg && i === 0) {
-          await state.responseMsg.edit(chunkText);
-        } else if (i === 0) {
-          state.responseMsg = await state.replyTo.reply(chunkText);
-        } else {
-          await sendToChannel(state.channel, chunks[i]);
-        }
+      while (remaining.length > 0) {
+        const chunk = remaining.slice(0, DISCORD_LIMIT);
+        await sendToChannel(state.channel, chunk);
+        state.displayedLength += chunk.length;
+        remaining = remaining.slice(DISCORD_LIMIT);
       }
     }
-    
-    state.buffer = "";
-    state.lastUpdate = Date.now();
-    return;
+  } catch (e) {
+    // Message might have been deleted
+  }
+}
+
+function scheduleUpdate(sessionKey: string, state: StreamState) {
+  if (state.flushTimer) clearTimeout(state.flushTimer);
+  
+  state.flushTimer = setTimeout(() => {
+    updateDiscordMessage(state).catch(() => {});
+  }, EDIT_COALESCE_MS);
+}
+
+async function flushFinal(state: StreamState) {
+  if (state.flushTimer) {
+    clearTimeout(state.flushTimer);
+    state.flushTimer = null;
   }
   
-  // Update existing message
-  try {
-    if (state.mode === "thinking") {
-      if (state.thinkingMsg) {
-        await state.thinkingMsg.edit(fullText);
+  state.isComplete = true;
+  
+  // Final update with all remaining content
+  if (state.buffer.trim()) {
+    const fullText = state.buffer.trim();
+    
+    try {
+      if (!state.message) {
+        // No message created yet - send it all
+        const chunks = splitMessage(fullText, DISCORD_LIMIT);
+        for (let i = 0; i < chunks.length; i++) {
+          if (i === 0) {
+            state.message = await state.replyTo.reply(chunks[i]);
+          } else {
+            await sendToChannel(state.channel, chunks[i]);
+          }
+        }
+      } else if (fullText.length <= DISCORD_LIMIT) {
+        // Fits in one message - final edit
+        await state.message.edit(fullText);
       } else {
-        state.thinkingMsg = await sendToChannel(state.channel, fullText) || null;
+        // Multiple messages needed - send remaining
+        const remaining = fullText.slice(state.displayedLength);
+        if (remaining) {
+          const chunks = splitMessage(remaining, DISCORD_LIMIT);
+          for (const chunk of chunks) {
+            await sendToChannel(state.channel, chunk);
+          }
+        }
       }
-    } else {
-      if (state.responseMsg) {
-        await state.responseMsg.edit(fullText);
-      } else {
-        state.responseMsg = await state.replyTo.reply(fullText);
-      }
-    }
-    state.lastUpdate = Date.now();
-  } catch (e) {
-    // Message might have been deleted or other error
+    } catch (e) {}
   }
 }
 
@@ -144,45 +172,38 @@ function splitMessage(text: string, maxLen: number): string[] {
   return chunks;
 }
 
-function scheduleFlush(sessionKey: string, state: StreamState) {
-  if (state.timeout) clearTimeout(state.timeout);
-  
-  state.timeout = setTimeout(() => {
-    flushState(state, false).catch(() => {});
-  }, COALESCE_MS);
-}
-
 async function handleStream(msg: StreamMessage, sessionKey: string) {
   if (msg.type !== "text" || !msg.content) return;
   
   const state = streams.get(sessionKey);
-  if (!state) return;
+  if (!state || state.isComplete) return;
   
   const text = msg.content;
   
   // Detect transition from thinking to response
   if (state.mode === "thinking" && looksLikeResponseStart(text)) {
-    // Flush any remaining thinking
-    await flushState(state, true);
+    // Flush thinking before switching
+    await updateDiscordMessage(state);
     state.mode = "response";
-    state.buffer = "";
   }
   
-  // Add to buffer
+  // Append to buffer
   state.buffer += text;
   
-  // Flush if buffer is large enough
-  if (state.buffer.length >= COALESCE_CHARS) {
-    await flushState(state, false);
+  // Check if we should update Discord (every N chars or on natural breaks)
+  const newContentLength = state.buffer.length - state.displayedLength;
+  const hasNaturalBreak = text.includes("\n\n") || text.includes(". ") || text.includes("? ") || text.includes("! ");
+  
+  if (newContentLength >= EDIT_COALESCE_CHARS || (hasNaturalBreak && newContentLength > 100)) {
+    await updateDiscordMessage(state);
   } else {
-    scheduleFlush(sessionKey, state);
+    scheduleUpdate(sessionKey, state);
   }
 }
 
 function looksLikeResponseStart(text: string): boolean {
   const trimmed = text.trim();
   
-  // Response markers
   if (trimmed.startsWith("#")) return true;
   if (trimmed.startsWith("---")) return true;
   if (trimmed.startsWith("```")) return true;
@@ -192,7 +213,6 @@ function looksLikeResponseStart(text: string): boolean {
   if (/^[A-Z][a-z]+ \d+:/.test(trimmed)) return true;
   if (trimmed.startsWith("**")) return true;
   
-  // Substantial formatted content
   if (text.length > 100 && (text.includes("```") || text.includes("**") || text.includes("|"))) {
     return true;
   }
@@ -242,21 +262,21 @@ async function handleMessage(message: Message) {
   
   const sessionKey = `discord-${message.channel.id}`;
   
-  // Clean up any existing stream for this session
+  // Clean up any existing stream
   const existing = streams.get(sessionKey);
-  if (existing?.timeout) clearTimeout(existing.timeout);
+  if (existing?.flushTimer) clearTimeout(existing.flushTimer);
   streams.delete(sessionKey);
   
   // Create new stream state
   const state: StreamState = {
     channel: message.channel,
     replyTo: message,
-    thinkingMsg: null,
-    responseMsg: null,
+    message: null,
     buffer: "",
+    displayedLength: 0,
     mode: "thinking",
-    lastUpdate: Date.now(),
-    timeout: null,
+    flushTimer: null,
+    isComplete: false,
   };
   streams.set(sessionKey, state);
   
@@ -273,11 +293,8 @@ async function handleMessage(message: Message) {
       }
     );
     
-    // Final flush
-    if (state.timeout) clearTimeout(state.timeout);
-    await flushState(state, true);
-    
-    // Clean up
+    // Final flush when complete
+    await flushFinal(state);
     streams.delete(sessionKey);
     
     try {
@@ -289,7 +306,7 @@ async function handleMessage(message: Message) {
     ctx.log.error("Discord inject error:", error);
     
     const state = streams.get(sessionKey);
-    if (state?.timeout) clearTimeout(state.timeout);
+    if (state?.flushTimer) clearTimeout(state.flushTimer);
     streams.delete(sessionKey);
     
     try {
@@ -303,7 +320,7 @@ async function handleMessage(message: Message) {
 
 const plugin: WOPRPlugin = {
   name: "wopr-plugin-discord",
-  version: "2.2.1",
+  version: "2.2.3",
   description: "Discord bot integration for WOPR with streaming support",
 
   async init(context: WOPRPluginContext) {
