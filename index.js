@@ -6,13 +6,55 @@
  */
 
 import { Client, GatewayIntentBits, Events } from "discord.js";
-import { writeFileSync, existsSync, mkdirSync } from "fs";
+import { writeFileSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import * as readline from "readline";
+import http from "http";
+import { createReadStream } from "fs";
+import { extname } from "path";
 
 let client = null;
 let ctx = null;
+let uiServer = null;
 const pendingDiscordRequests = new Set(); // Track requests we initiated
+
+// Content types for UI server
+const CONTENT_TYPES = {
+  ".js": "application/javascript",
+  ".css": "text/css",
+  ".html": "text/html",
+  ".json": "application/json",
+};
+
+// Start HTTP server to serve UI component
+function startUIServer(port = 7332) {
+  const server = http.createServer((req, res) => {
+    const url = req.url === "/" ? "/ui.js" : req.url;
+    const filePath = join(ctx.getPluginDir(), url);
+    const ext = extname(filePath).toLowerCase();
+    
+    res.setHeader("Content-Type", CONTENT_TYPES[ext] || "application/octet-stream");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    
+    try {
+      const stream = createReadStream(filePath);
+      stream.pipe(res);
+      stream.on("error", () => {
+        res.statusCode = 404;
+        res.end("Not found");
+      });
+    } catch (err) {
+      res.statusCode = 500;
+      res.end("Error");
+    }
+  });
+  
+  server.listen(port, "127.0.0.1", () => {
+    ctx.log.info(`Discord UI available at http://127.0.0.1:${port}`);
+  });
+  
+  return server;
+}
 
 // ============================================================================
 // Pairing Requests (user-initiated, owner-approved)
@@ -831,8 +873,35 @@ Discord Bot Setup
     ctx = context;
     const config = context.getConfig();
 
+    // Start UI server and register component
+    const uiPort = config.uiPort || 7332;
+    uiServer = startUIServer(uiPort);
+    
+    // Register UI component in main WOPR UI
+    if (context.registerUiComponent) {
+      context.registerUiComponent({
+        id: "discord-panel",
+        title: "Discord",
+        moduleUrl: `http://127.0.0.1:${uiPort}/ui.js`,
+        slot: "settings",
+        description: "Manage Discord bot integration",
+      });
+      context.log.info("Registered Discord UI component in WOPR settings");
+    }
+    
+    // Also register as external link for backward compatibility
+    if (context.registerWebUiExtension) {
+      context.registerWebUiExtension({
+        id: "discord",
+        title: "Discord",
+        url: `http://127.0.0.1:${uiPort}`,
+        description: "Discord integration settings",
+        category: "integrations",
+      });
+    }
+
     if (!config.token) {
-      context.log.warn("Discord not configured. Run: wopr discord auth");
+      context.log.warn("Discord not configured. Run: wopr discord auth or use the web UI");
       return;
     }
 
@@ -897,6 +966,11 @@ Discord Bot Setup
       ctx?.log.info("Discord disconnecting...");
       await client.destroy();
       client = null;
+    }
+    if (uiServer) {
+      ctx?.log.info("Discord UI server shutting down...");
+      await new Promise((resolve) => uiServer.close(resolve));
+      uiServer = null;
     }
   },
 };
