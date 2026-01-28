@@ -65,7 +65,7 @@ async function flushState(state: StreamState, force: boolean = false) {
   if (!state.buffer.trim()) return;
   
   const text = state.buffer.trim();
-  const prefix = state.mode === "thinking" ? "💭 " : "";
+  const prefix = "";
   const fullText = prefix + text;
   
   // Check if we need to split (Discord 2000 char limit)
