@@ -126,7 +126,21 @@ async function processPending(state: StreamState, sessionKey: string) {
 }
 
 async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: string) {
-  if (msg.type !== "text" || !msg.content) return;
+  // Extract text content from various provider formats
+  let textContent = "";
+  if (msg.type === "text" && msg.content) {
+    textContent = msg.content;
+  } else if (msg.type === "assistant" && msg.message?.content) {
+    // Handle nested content array from providers like Kimi
+    const content = msg.message.content;
+    if (Array.isArray(content)) {
+      textContent = content.map((c: any) => c.text || "").join("");
+    } else if (typeof content === "string") {
+      textContent = content;
+    }
+  }
+  
+  if (!textContent) return;
   
   const now = Date.now();
   const timeSinceLast = now - state.lastTokenTime;
@@ -141,7 +155,7 @@ async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: 
   }
   
   state.lastTokenTime = now;
-  state.currentMsg.addContent(msg.content);
+  state.currentMsg.addContent(textContent);
   
   // Flush current message
   const needsNewMsg = await state.currentMsg.flush(state.channel, state.replyTo);
