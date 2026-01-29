@@ -127,6 +127,7 @@ interface StreamState {
   lastTokenTime: number;
   processing: boolean;
   pending: { msg: StreamMessage; sessionKey: string }[];
+  finalizeTimer: NodeJS.Timeout | null;
 }
 
 const streams = new Map<string, StreamState>();
@@ -179,6 +180,11 @@ async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: 
   
   state.lastTokenTime = now;
   state.currentMsg.addContent(textContent);
+  
+  // Reset finalize timer after each chunk
+  if ((state as any).setupFinalizeTimer) {
+    (state as any).setupFinalizeTimer();
+  }
   
   // Flush current message
   const needsNewMsg = await state.currentMsg.flush(state.channel, state.replyTo);
@@ -250,7 +256,24 @@ async function handleMessage(message: Message) {
     lastTokenTime: Date.now(),
     processing: false,
     pending: [],
+    finalizeTimer: null,
   };
+  
+  // Setup finalize timer - sends message after 2s of inactivity even if buffer < 800 chars
+  const setupFinalizeTimer = () => {
+    if (state.finalizeTimer) clearTimeout(state.finalizeTimer);
+    state.finalizeTimer = setTimeout(async () => {
+      if (state.currentMsg.buffer.length > 0 && !state.currentMsg.isFinalized) {
+        logger.info({ msg: "Finalize timer triggered", sessionKey, bufferLength: state.currentMsg.buffer.length });
+        await state.currentMsg.finalize(state.channel, state.replyTo);
+      }
+    }, 2000); // 2 seconds
+  };
+  
+  // Store timer setup function on state for processChunk to use
+  (state as any).setupFinalizeTimer = setupFinalizeTimer;
+  setupFinalizeTimer(); // Start initial timer
+  
   streams.set(sessionKey, state);
   
   logger.info({ msg: "New stream", sessionKey });
@@ -266,11 +289,13 @@ async function handleMessage(message: Message) {
     
     // Finalize last message
     await state.currentMsg.finalize(state.channel, state.replyTo);
+    if (state.finalizeTimer) clearTimeout(state.finalizeTimer);
     streams.delete(sessionKey);
     
     try { await message.reactions.cache.get("👀")?.users.remove(client.user.id); await message.react("✅"); } catch (e) {}
   } catch (error: any) {
     logger.error({ msg: "Inject failed", error: String(error) });
+    if (state.finalizeTimer) clearTimeout(state.finalizeTimer);
     streams.delete(sessionKey);
     try { await message.reactions.cache.get("👀")?.users.remove(client.user.id); await message.react("❌"); } catch (e) {}
     await message.reply("Error processing your request.");
