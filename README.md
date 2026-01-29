@@ -1,6 +1,12 @@
 # WOPR Discord Plugin
 
-Discord bot integration for WOPR - enables AI conversations in Discord channels with full context awareness.
+[![npm version](https://img.shields.io/npm/v/wopr-plugin-discord.svg)](https://www.npmjs.com/package/wopr-plugin-discord)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![WOPR](https://img.shields.io/badge/WOPR-Plugin-blue)](https://github.com/TSavo/wopr)
+
+Discord bot integration for [WOPR](https://github.com/TSavo/wopr) - enables AI conversations in Discord channels with full context awareness.
+
+> Part of the [WOPR](https://github.com/TSavo/wopr) ecosystem - Self-sovereign AI session management over P2P.
 
 ## Features
 
