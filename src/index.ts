@@ -185,102 +185,477 @@ function getSessionState(sessionKey: string): SessionState {
   return sessionStates.get(sessionKey)!;
 }
 
-// Discord streaming message handler
+// Discord streaming message handler with explicit state machine
 const DISCORD_LIMIT = 2000;
 const EDIT_THRESHOLD = 800;
 const IDLE_SPLIT_MS = 1000;
+const FLUSH_DEBOUNCE_MS = 300;
 
-class DiscordMessage {
-  discordMsg: Message | null = null;
-  buffer = "";
-  lastEditLength = 0;
-  isReply: boolean;
-  isFinalized = false;
-  
-  constructor(isReply: boolean) {
+// Explicit state machine - each state is mutually exclusive
+type MessageState =
+  | { status: 'buffering'; content: string }
+  | { status: 'sending'; content: string; promise: Promise<Message> }
+  | { status: 'sent'; content: string; discordMsg: Message; lastEditLength: number }
+  | { status: 'finalized' };
+
+/**
+ * Manages a single Discord message's lifecycle with edit-in-place support.
+ * Uses explicit state machine to prevent race conditions.
+ */
+class DiscordMessageUnit {
+  private state: MessageState = { status: 'buffering', content: '' };
+  private readonly channel: TextChannel | ThreadChannel | DMChannel;
+  private readonly replyTo: Message;
+  private readonly isReply: boolean;
+  private readonly unitId: string;
+
+  constructor(
+    channel: TextChannel | ThreadChannel | DMChannel,
+    replyTo: Message,
+    isReply: boolean
+  ) {
+    this.channel = channel;
+    this.replyTo = replyTo;
     this.isReply = isReply;
+    this.unitId = Math.random().toString(36).slice(2, 8);
+    logger.debug({ msg: "DiscordMessageUnit created", unitId: this.unitId, isReply });
   }
-  
-  addContent(text: string): void {
-    this.buffer += text;
+
+  get content(): string {
+    if (this.state.status === 'finalized') return '';
+    return this.state.content;
   }
-  
-  async flush(channel: TextChannel | ThreadChannel | DMChannel, replyTo: Message): Promise<boolean> {
-    if (this.isFinalized || !this.buffer.trim()) return false;
-    
-    const content = this.buffer.trim();
-    
+
+  get isFinalized(): boolean {
+    return this.state.status === 'finalized';
+  }
+
+  get discordMsg(): Message | null {
+    if (this.state.status === 'sent') return this.state.discordMsg;
+    return null;
+  }
+
+  append(text: string): void {
+    if (this.state.status === 'finalized') {
+      logger.debug({ msg: "Unit.append ignored - finalized", unitId: this.unitId, textLen: text.length });
+      return;
+    }
+    if (this.state.status === 'sending') {
+      logger.debug({ msg: "Unit.append ignored - sending", unitId: this.unitId, textLen: text.length });
+      return;
+    }
+    const prevLen = this.state.content.length;
+    this.state = { ...this.state, content: this.state.content + text };
+    logger.debug({ msg: "Unit.append", unitId: this.unitId, added: text.length, totalLen: this.state.content.length, prevLen });
+  }
+
+  /**
+   * Attempt to flush content to Discord.
+   * Returns 'split' if content exceeded limit and needs continuation.
+   */
+  async flush(): Promise<'ok' | 'split' | 'skip'> {
+    if (this.state.status === 'finalized') {
+      logger.debug({ msg: "Unit.flush skip - finalized", unitId: this.unitId });
+      return 'skip';
+    }
+    if (this.state.status === 'sending') {
+      logger.debug({ msg: "Unit.flush skip - sending", unitId: this.unitId });
+      return 'skip';
+    }
+
+    const content = this.state.content.trim();
+    if (!content) {
+      logger.debug({ msg: "Unit.flush skip - empty", unitId: this.unitId });
+      return 'skip';
+    }
+
+    logger.debug({ msg: "Unit.flush", unitId: this.unitId, status: this.state.status, contentLen: content.length });
+
+    // Handle overflow - need to split
     if (content.length > DISCORD_LIMIT) {
-      const toSend = content.slice(0, DISCORD_LIMIT);
-      if (this.discordMsg) {
-        await this.discordMsg.edit(toSend);
+      logger.debug({ msg: "Unit.flush overflow", unitId: this.unitId, contentLen: content.length });
+      return this.handleOverflow(content);
+    }
+
+    // In buffering state - check if we have enough to send initial message
+    if (this.state.status === 'buffering') {
+      if (content.length < EDIT_THRESHOLD) {
+        logger.debug({ msg: "Unit.flush skip - below threshold", unitId: this.unitId, contentLen: content.length, threshold: EDIT_THRESHOLD });
+        return 'skip';
+      }
+      return this.sendInitial(content);
+    }
+
+    // In sent state - check if we have enough new content to edit
+    if (this.state.status === 'sent') {
+      const newChars = content.length - this.state.lastEditLength;
+      if (newChars < EDIT_THRESHOLD) {
+        logger.debug({ msg: "Unit.flush skip - not enough new chars", unitId: this.unitId, newChars, threshold: EDIT_THRESHOLD });
+        return 'skip';
+      }
+      return this.editExisting(content);
+    }
+
+    return 'skip';
+  }
+
+  private async sendInitial(content: string): Promise<'ok' | 'split' | 'skip'> {
+    if (this.state.status !== 'buffering') return 'skip';
+
+    logger.debug({ msg: "Unit.sendInitial", unitId: this.unitId, contentLen: content.length, isReply: this.isReply });
+
+    // Transition: buffering → sending
+    const promise = this.isReply
+      ? this.replyTo.reply(content)
+      : this.channel.send(content);
+    this.state = { status: 'sending', content, promise };
+
+    try {
+      const discordMsg = await promise;
+      // Transition: sending → sent
+      this.state = { status: 'sent', content, discordMsg, lastEditLength: content.length };
+      logger.debug({ msg: "Unit.sendInitial success", unitId: this.unitId, msgId: discordMsg.id });
+      return 'ok';
+    } catch (error) {
+      // Rollback to buffering on failure
+      this.state = { status: 'buffering', content };
+      logger.error({ msg: "Unit.sendInitial failed", unitId: this.unitId, error: String(error) });
+      throw error;
+    }
+  }
+
+  private async editExisting(content: string): Promise<'ok' | 'split' | 'skip'> {
+    if (this.state.status !== 'sent') return 'skip';
+
+    logger.debug({ msg: "Unit.editExisting", unitId: this.unitId, contentLen: content.length });
+    await this.state.discordMsg.edit(content);
+    this.state = { ...this.state, content, lastEditLength: content.length };
+    logger.debug({ msg: "Unit.editExisting success", unitId: this.unitId });
+    return 'ok';
+  }
+
+  private async handleOverflow(content: string): Promise<'ok' | 'split' | 'skip'> {
+    const toSend = content.slice(0, DISCORD_LIMIT);
+    const overflow = content.slice(DISCORD_LIMIT);
+    logger.debug({ msg: "Unit.handleOverflow", unitId: this.unitId, toSendLen: toSend.length, overflowLen: overflow.length });
+
+    if (this.state.status === 'buffering') {
+      // Send initial with truncated content
+      const promise = this.isReply
+        ? this.replyTo.reply(toSend)
+        : this.channel.send(toSend);
+      this.state = { status: 'sending', content: toSend, promise };
+
+      try {
+        await promise;
+        // Mark as finalized - overflow will be new message
+        this.state = { status: 'finalized' };
+        logger.debug({ msg: "Unit.handleOverflow sent and finalized", unitId: this.unitId });
+      } catch (error) {
+        this.state = { status: 'buffering', content };
+        logger.error({ msg: "Unit.handleOverflow failed", unitId: this.unitId, error: String(error) });
+        throw error;
+      }
+    } else if (this.state.status === 'sent') {
+      await this.state.discordMsg.edit(toSend);
+      this.state = { status: 'finalized' };
+      logger.debug({ msg: "Unit.handleOverflow edited and finalized", unitId: this.unitId });
+    }
+
+    // Signal that we have overflow content for a new message
+    return 'split';
+  }
+
+  /**
+   * Finalize this message - send/edit with final content.
+   * Safe to call multiple times.
+   */
+  async finalize(): Promise<void> {
+    logger.debug({ msg: "Unit.finalize called", unitId: this.unitId, status: this.state.status, contentLen: this.state.status !== 'finalized' ? this.state.content.length : 0 });
+
+    if (this.state.status === 'finalized') {
+      logger.debug({ msg: "Unit.finalize skip - already finalized", unitId: this.unitId });
+      return;
+    }
+
+    // Wait for any in-flight send to complete
+    if (this.state.status === 'sending') {
+      logger.debug({ msg: "Unit.finalize waiting for send", unitId: this.unitId });
+      try {
+        const discordMsg = await this.state.promise;
+        this.state = { status: 'sent', content: this.state.content, discordMsg, lastEditLength: this.state.content.length };
+        logger.debug({ msg: "Unit.finalize send completed", unitId: this.unitId, msgId: discordMsg.id });
+      } catch (error) {
+        logger.error({ msg: "Unit.finalize send failed", unitId: this.unitId, error: String(error) });
+        this.state = { status: 'finalized' };
+        return;
+      }
+    }
+
+    const content = this.state.content.trim();
+    if (!content) {
+      logger.debug({ msg: "Unit.finalize skip - empty content", unitId: this.unitId });
+      this.state = { status: 'finalized' };
+      return;
+    }
+
+    // Immediately mark as finalized to prevent races
+    const prevState = this.state;
+    this.state = { status: 'finalized' };
+
+    try {
+      if (prevState.status === 'sent') {
+        logger.debug({ msg: "Unit.finalize editing sent message", unitId: this.unitId, contentLen: content.length });
+        await prevState.discordMsg.edit(content.slice(0, DISCORD_LIMIT));
+        logger.debug({ msg: "Unit.finalize edit success", unitId: this.unitId });
+      } else if (prevState.status === 'buffering') {
+        logger.debug({ msg: "Unit.finalize sending buffered content", unitId: this.unitId, contentLen: content.length, isReply: this.isReply });
+        const msg = this.isReply
+          ? await this.replyTo.reply(content.slice(0, DISCORD_LIMIT))
+          : await this.channel.send(content.slice(0, DISCORD_LIMIT));
+        // Already finalized, but store reference if needed
+        (this as any)._finalMsg = msg;
+        logger.debug({ msg: "Unit.finalize send success", unitId: this.unitId, msgId: msg.id });
+      }
+    } catch (error) {
+      logger.error({ msg: "Unit.finalize failed", unitId: this.unitId, error: String(error) });
+    }
+  }
+
+  /**
+   * Get overflow content after a split (content that exceeded DISCORD_LIMIT)
+   */
+  getOverflow(originalContent: string): string {
+    return originalContent.slice(DISCORD_LIMIT);
+  }
+}
+
+/**
+ * Coordinates streaming of potentially multiple Discord messages.
+ * Handles idle-split, overflow, and debounced flushing.
+ */
+class DiscordMessageStream {
+  private currentUnit: DiscordMessageUnit;
+  private completedUnits: DiscordMessageUnit[] = [];
+  private readonly channel: TextChannel | ThreadChannel | DMChannel;
+  private readonly replyTo: Message;
+  private readonly streamId: string;
+
+  private lastAppendTime = Date.now();
+  private flushTimer: NodeJS.Timeout | null = null;
+  private pendingContent: string[] = [];
+  private processing = false;
+  private finalized = false;
+
+  constructor(channel: TextChannel | ThreadChannel | DMChannel, replyTo: Message) {
+    this.channel = channel;
+    this.replyTo = replyTo;
+    this.streamId = Math.random().toString(36).slice(2, 8);
+    this.currentUnit = new DiscordMessageUnit(channel, replyTo, true); // First message is reply
+    logger.info({ msg: "Stream created", streamId: this.streamId, channelId: channel.id });
+  }
+
+  /**
+   * Add content from a stream chunk.
+   */
+  append(text: string): void {
+    if (this.finalized) {
+      logger.debug({ msg: "Stream.append ignored - finalized", streamId: this.streamId, textLen: text.length });
+      return;
+    }
+    this.pendingContent.push(text);
+    const totalPending = this.pendingContent.reduce((sum, t) => sum + t.length, 0);
+    const currentUnitLen = this.currentUnit.content.length;
+    const totalContent = totalPending + currentUnitLen;
+
+    logger.debug({ msg: "Stream.append", streamId: this.streamId, textLen: text.length, totalContent, pendingCount: this.pendingContent.length });
+
+    // If we have enough content to send, process immediately
+    if (totalContent >= EDIT_THRESHOLD) {
+      logger.debug({ msg: "Stream.append - threshold reached, processing immediately", streamId: this.streamId, totalContent, threshold: EDIT_THRESHOLD });
+      this.scheduleProcessing(true); // immediate
+    } else {
+      this.scheduleProcessing(false); // debounced
+    }
+  }
+
+  private scheduleProcessing(immediate: boolean = false): void {
+    if (this.processing) {
+      logger.debug({ msg: "Stream.scheduleProcessing - already processing", streamId: this.streamId });
+      return;
+    }
+
+    // Clear any existing timer
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    if (immediate) {
+      // Process on next tick to allow current call stack to complete
+      logger.debug({ msg: "Stream.scheduleProcessing - immediate", streamId: this.streamId });
+      setImmediate(() => this.processPending());
+    } else {
+      // Debounce flush to batch rapid chunks when below threshold
+      logger.debug({ msg: "Stream.scheduleProcessing - debounced", streamId: this.streamId, debounceMs: FLUSH_DEBOUNCE_MS });
+      this.flushTimer = setTimeout(() => this.processPending(), FLUSH_DEBOUNCE_MS);
+    }
+  }
+
+  private async processPending(): Promise<void> {
+    if (this.processing || this.finalized) {
+      logger.debug({ msg: "Stream.processPending skip", streamId: this.streamId, processing: this.processing, finalized: this.finalized });
+      return;
+    }
+    this.processing = true;
+    logger.debug({ msg: "Stream.processPending start", streamId: this.streamId, pendingCount: this.pendingContent.length });
+
+    try {
+      while (this.pendingContent.length > 0) {
+        const text = this.pendingContent.shift()!;
+        await this.processText(text);
+      }
+      logger.debug({ msg: "Stream.processPending complete", streamId: this.streamId });
+    } catch (error) {
+      logger.error({ msg: "Stream processing error", streamId: this.streamId, error: String(error) });
+    } finally {
+      this.processing = false;
+    }
+  }
+
+  private async processText(text: string): Promise<void> {
+    const now = Date.now();
+    const timeSinceLast = now - this.lastAppendTime;
+    this.lastAppendTime = now;
+
+    logger.debug({ msg: "Stream.processText", streamId: this.streamId, textLen: text.length, timeSinceLast });
+
+    // Idle split: long pause with existing content → start new message
+    if (timeSinceLast > IDLE_SPLIT_MS && this.currentUnit.content.length > 0) {
+      logger.info({ msg: "Stream idle split", streamId: this.streamId, timeSinceLast, unitContent: this.currentUnit.content.length });
+      await this.currentUnit.finalize();
+      this.completedUnits.push(this.currentUnit);
+      this.currentUnit = new DiscordMessageUnit(this.channel, this.replyTo, false);
+    }
+
+    // Add content to current unit
+    this.currentUnit.append(text);
+
+    // Handle content that exceeds Discord limit - may need multiple messages
+    await this.flushWithOverflowHandling();
+  }
+
+  /**
+   * Flush current unit, handling overflow by creating new units as needed.
+   */
+  private async flushWithOverflowHandling(): Promise<void> {
+    while (true) {
+      const currentContent = this.currentUnit.content;
+      const result = await this.currentUnit.flush();
+      logger.debug({ msg: "Stream.flushWithOverflowHandling result", streamId: this.streamId, result, contentLen: currentContent.length });
+
+      if (result === 'split') {
+        // Unit sent first 2000 chars and finalized - extract overflow for new unit
+        const overflow = currentContent.slice(DISCORD_LIMIT);
+        logger.info({ msg: "Stream overflow split", streamId: this.streamId, overflowLen: overflow.length });
+        this.completedUnits.push(this.currentUnit);
+        this.currentUnit = new DiscordMessageUnit(this.channel, this.replyTo, false);
+
+        if (overflow.length > 0) {
+          this.currentUnit.append(overflow);
+          // Continue loop to handle if overflow itself exceeds limit
+        } else {
+          break;
+        }
       } else {
-        this.discordMsg = this.isReply 
-          ? await replyTo.reply(toSend)
-          : await channel.send(toSend);
-      }
-      this.buffer = content.slice(DISCORD_LIMIT);
-      this.lastEditLength = 0;
-      this.isFinalized = true;
-      return true;
-    }
-    
-    const newContent = content.slice(this.lastEditLength);
-    if (this.discordMsg) {
-      if (newContent.length >= EDIT_THRESHOLD) {
-        await this.discordMsg.edit(content);
-        this.lastEditLength = content.length;
-      }
-    } else {
-      if (content.length >= EDIT_THRESHOLD) {
-        this.discordMsg = this.isReply 
-          ? await replyTo.reply(content)
-          : await channel.send(content);
-        this.lastEditLength = content.length;
+        // 'ok' or 'skip' - no overflow, we're done
+        break;
       }
     }
-    return false;
   }
-  
-  async finalize(channel: TextChannel | ThreadChannel | DMChannel, replyTo: Message): Promise<void> {
-    if (this.isFinalized || !this.buffer.trim()) return;
-    const content = this.buffer.trim();
-    if (this.discordMsg) {
-      await this.discordMsg.edit(content);
-    } else {
-      this.discordMsg = this.isReply 
-        ? await replyTo.reply(content)
-        : await channel.send(content);
+
+  /**
+   * Finalize the entire stream - flush any remaining content.
+   */
+  async finalize(): Promise<void> {
+    logger.info({ msg: "Stream.finalize called", streamId: this.streamId, finalized: this.finalized, processing: this.processing, pendingCount: this.pendingContent.length });
+
+    if (this.finalized) {
+      logger.debug({ msg: "Stream.finalize skip - already finalized", streamId: this.streamId });
+      return;
     }
-    this.isFinalized = true;
+
+    // Cancel any pending flush timer (we'll process everything now)
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+      logger.debug({ msg: "Stream.finalize cancelled pending flush timer", streamId: this.streamId });
+    }
+
+    // Wait for any ongoing processing to complete
+    if (this.processing) {
+      logger.info({ msg: "Stream.finalize waiting for processing to complete", streamId: this.streamId });
+      // Poll until processing completes (processPending sets processing=false in finally block)
+      let waitCount = 0;
+      while (this.processing && waitCount < 100) { // Max 10 seconds
+        await new Promise(resolve => setTimeout(resolve, 100));
+        waitCount++;
+      }
+      if (this.processing) {
+        logger.warn({ msg: "Stream.finalize timed out waiting for processing", streamId: this.streamId });
+      } else {
+        logger.debug({ msg: "Stream.finalize processing completed", streamId: this.streamId, waitCount });
+      }
+    }
+
+    this.finalized = true;
+
+    // Process any remaining pending content
+    const remainingCount = this.pendingContent.length;
+    if (remainingCount > 0) {
+      logger.debug({ msg: "Stream.finalize processing remaining content", streamId: this.streamId, remainingCount });
+      while (this.pendingContent.length > 0) {
+        const text = this.pendingContent.shift()!;
+        this.currentUnit.append(text);
+      }
+      // Flush with overflow handling for any accumulated content
+      await this.flushWithOverflowHandling();
+    }
+
+    // Finalize current unit
+    logger.debug({ msg: "Stream.finalize finalizing current unit", streamId: this.streamId, unitContent: this.currentUnit.content.length });
+    await this.currentUnit.finalize();
+    logger.info({ msg: "Stream.finalize complete", streamId: this.streamId, completedUnits: this.completedUnits.length + 1 });
+  }
+
+  /**
+   * Get the last Discord message (for appending usage stats, etc.)
+   */
+  getLastMessage(): Message | null {
+    const msg = this.currentUnit.discordMsg;
+    logger.debug({ msg: "Stream.getLastMessage", streamId: this.streamId, hasMsg: !!msg });
+    return msg;
   }
 }
 
-interface StreamState {
-  channel: TextChannel | ThreadChannel | DMChannel;
-  replyTo: Message;
-  messages: DiscordMessage[];
-  currentMsg: DiscordMessage;
-  lastTokenTime: number;
-  processing: boolean;
-  pending: { msg: StreamMessage; sessionKey: string }[];
-  finalizeTimer: NodeJS.Timeout | null;
-}
+// Stream registry - one stream per session
+const streams = new Map<string, DiscordMessageStream>();
 
-const streams = new Map<string, StreamState>();
-
-async function processPending(state: StreamState, sessionKey: string) {
-  while (state.pending.length > 0) {
-    const { msg } = state.pending.shift()!;
-    await processChunk(msg, state, sessionKey);
+/**
+ * Handle an incoming stream chunk.
+ */
+async function handleChunk(msg: StreamMessage, sessionKey: string): Promise<void> {
+  const stream = streams.get(sessionKey);
+  if (!stream) {
+    logger.warn({ msg: "handleChunk - no stream found", sessionKey, msgType: msg.type });
+    return;
   }
-  state.processing = false;
-}
 
-async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: string) {
+  // Extract text content from various message formats
   let textContent = "";
   if (msg.type === "text" && msg.content) {
     textContent = msg.content;
+    logger.debug({ msg: "handleChunk - text content", sessionKey, contentLen: textContent.length });
   } else if (msg.type === "assistant" && (msg as any).message?.content) {
     const content = (msg as any).message.content;
     if (Array.isArray(content)) {
@@ -288,50 +663,13 @@ async function processChunk(msg: StreamMessage, state: StreamState, sessionKey: 
     } else if (typeof content === "string") {
       textContent = content;
     }
+    logger.debug({ msg: "handleChunk - assistant content", sessionKey, contentLen: textContent.length });
+  } else {
+    logger.debug({ msg: "handleChunk - skipping non-text", sessionKey, msgType: msg.type });
   }
-  
-  if (!textContent) return;
-  
-  const now = Date.now();
-  const timeSinceLast = now - state.lastTokenTime;
-  
-  if (timeSinceLast > IDLE_SPLIT_MS && state.currentMsg.buffer.length > 0) {
-    await state.currentMsg.finalize(state.channel, state.replyTo);
-    const newMsg = new DiscordMessage(false);
-    state.messages.push(state.currentMsg);
-    state.currentMsg = newMsg;
-  }
-  
-  state.lastTokenTime = now;
-  state.currentMsg.addContent(textContent);
-  
-  if ((state as any).setupFinalizeTimer) {
-    (state as any).setupFinalizeTimer();
-  }
-  
-  const needsNewMsg = await state.currentMsg.flush(state.channel, state.replyTo);
-  
-  if (needsNewMsg) {
-    const newMsg = new DiscordMessage(false);
-    newMsg.buffer = state.currentMsg.buffer;
-    state.messages.push(state.currentMsg);
-    state.currentMsg = newMsg;
-    await state.currentMsg.flush(state.channel, state.replyTo);
-  }
-}
 
-async function handleChunk(msg: StreamMessage, sessionKey: string) {
-  const state = streams.get(sessionKey);
-  if (!state) return;
-  
-  state.pending.push({ msg, sessionKey });
-  
-  if (!state.processing) {
-    state.processing = true;
-    processPending(state, sessionKey).catch((e) => {
-      logger.error({ msg: "Chunk processing error", error: String(e) });
-      state.processing = false;
-    });
+  if (textContent) {
+    stream.append(textContent);
   }
 }
 
@@ -515,36 +853,31 @@ async function getSessionInfo(sessionKey: string): Promise<string> {
 
 async function handleWoprMessage(interaction: ChatInputCommandInteraction, messageContent: string) {
   if (!ctx || !client) return;
-  
+
   const sessionKey = `discord-${interaction.channelId}`;
   const state = getSessionState(sessionKey);
   state.messageCount++;
-  
+
   // Defer reply since AI response takes time
   await interaction.deferReply();
-  
+
   // Add thinking level context
   let fullMessage = messageContent;
   if (state.thinkingLevel !== "medium") {
     fullMessage = `[Thinking level: ${state.thinkingLevel}] ${messageContent}`;
   }
-  
-  streams.delete(sessionKey);
-  
-  const currentMsg = new DiscordMessage(false);
-  const streamState: StreamState = {
-    channel: interaction.channel as TextChannel | ThreadChannel | DMChannel,
-    replyTo: null as any, // Will use editReply instead
-    messages: [],
-    currentMsg,
-    lastTokenTime: Date.now(),
-    processing: false,
-    pending: [],
-    finalizeTimer: null,
-  };
-  
+
+  // Clean up any existing stream
+  const existingStream = streams.get(sessionKey);
+  if (existingStream) {
+    await existingStream.finalize();
+    streams.delete(sessionKey);
+  }
+
+  // For slash commands, we use a simple buffer since we edit the deferred reply
   let responseBuffer = "";
-  
+  let lastEditLength = 0;
+
   try {
     const response = await ctx.inject(sessionKey, fullMessage, {
       from: interaction.user.username,
@@ -553,18 +886,19 @@ async function handleWoprMessage(interaction: ChatInputCommandInteraction, messa
         // Collect response for editing
         if (msg.type === "text" && msg.content) {
           responseBuffer += msg.content;
-          // Edit reply every few chunks
-          if (responseBuffer.length % 500 < 50) {
-            interaction.editReply(responseBuffer.slice(0, 2000)).catch(() => {});
+          // Edit reply when we have enough new content (debounce edits)
+          if (responseBuffer.length - lastEditLength >= EDIT_THRESHOLD) {
+            lastEditLength = responseBuffer.length;
+            interaction.editReply(responseBuffer.slice(0, DISCORD_LIMIT)).catch(() => {});
           }
         }
       }
     });
-    
+
     // Final edit with complete response
     const usage = state.usageMode !== "off" ? `\n\n_Usage: ${state.messageCount} messages_` : "";
-    await interaction.editReply((response + usage).slice(0, 2000));
-    
+    await interaction.editReply((response + usage).slice(0, DISCORD_LIMIT));
+
   } catch (error: any) {
     logger.error({ msg: "Slash command inject failed", error: String(error) });
     await interaction.editReply("❌ Error processing your request.");
@@ -576,22 +910,22 @@ async function handleMessage(message: Message) {
   if (!client || !ctx) return;
   if (message.author.bot) return;
   if (!client.user) return;
-  
+
   // Ignore slash command interactions
   if (message.interaction) return;
 
   const isDirectlyMentioned = message.mentions.users.has(client.user.id);
   const isDM = message.channel.type === 1;
-  
+
   const authorDisplayName = message.member?.displayName || (message.author as any).displayName || message.author.username;
-  
-  try { 
-    ctx.logMessage(`discord-${message.channel.id}`, message.content, { 
-      from: authorDisplayName, 
-      channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name } 
-    }); 
+
+  try {
+    ctx.logMessage(`discord-${message.channel.id}`, message.content, {
+      from: authorDisplayName,
+      channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name }
+    });
   } catch (e) {}
-  
+
   if (!isDirectlyMentioned && !isDM) return;
 
   let messageContent = message.content;
@@ -600,80 +934,81 @@ async function handleMessage(message: Message) {
     const botNicknameMention = `<@!${client.user.id}>`;
     messageContent = messageContent.replace(botNicknameMention, "").replace(botMention, "").trim();
   }
-  
+
   if (!messageContent) return; // Skip empty mentions
-  
+
+  const sessionKey = `discord-${message.channel.id}`;
+  logger.info({ msg: "handleMessage - processing mention", sessionKey, author: authorDisplayName, contentLen: messageContent.length });
+
   const ackEmoji = getAckReaction();
   try { await message.react(ackEmoji); } catch (e) {}
-  
-  const sessionKey = `discord-${message.channel.id}`;
+
   const state = getSessionState(sessionKey);
   state.messageCount++;
-  
-  streams.delete(sessionKey);
-  
-  const currentMsg = new DiscordMessage(true);
-  const streamState: StreamState = {
-    channel: message.channel as TextChannel | ThreadChannel | DMChannel,
-    replyTo: message,
-    messages: [],
-    currentMsg,
-    lastTokenTime: Date.now(),
-    processing: false,
-    pending: [],
-    finalizeTimer: null,
-  };
-  
-  const setupFinalizeTimer = () => {
-    if (streamState.finalizeTimer) clearTimeout(streamState.finalizeTimer);
-    streamState.finalizeTimer = setTimeout(async () => {
-      if (streamState.currentMsg.buffer.length > 0 && !streamState.currentMsg.isFinalized) {
-        await streamState.currentMsg.finalize(streamState.channel, streamState.replyTo);
-      }
-    }, 2000);
-  };
-  
-  (streamState as any).setupFinalizeTimer = setupFinalizeTimer;
-  setupFinalizeTimer();
-  
-  streams.set(sessionKey, streamState);
-  
+
+  // Clean up any existing stream for this session
+  const existingStream = streams.get(sessionKey);
+  if (existingStream) {
+    logger.info({ msg: "handleMessage - cleaning up existing stream", sessionKey });
+    await existingStream.finalize();
+  }
+
+  // Create new stream with explicit state machine
+  const stream = new DiscordMessageStream(
+    message.channel as TextChannel | ThreadChannel | DMChannel,
+    message
+  );
+  streams.set(sessionKey, stream);
+  logger.info({ msg: "handleMessage - stream created, calling inject", sessionKey });
+
   // Add thinking level context
   if (state.thinkingLevel !== "medium") {
     messageContent = `[Thinking level: ${state.thinkingLevel}] ${messageContent}`;
   }
-  
+
   try {
+    logger.info({ msg: "handleMessage - inject starting", sessionKey });
     await ctx.inject(sessionKey, messageContent, {
       from: authorDisplayName,
       channel: { type: "discord", id: message.channel.id, name: (message.channel as any).name },
       onStream: (msg: StreamMessage) => {
-        handleChunk(msg, sessionKey).catch((e) => logger.error({ msg: "Chunk error", error: String(e) }));
+        handleChunk(msg, sessionKey).catch((e) => logger.error({ msg: "Chunk error", sessionKey, error: String(e) }));
       }
     });
-    
-    await streamState.currentMsg.finalize(streamState.channel, streamState.replyTo);
-    if (streamState.finalizeTimer) clearTimeout(streamState.finalizeTimer);
+    logger.info({ msg: "handleMessage - inject complete", sessionKey });
+
+    // Finalize the stream
+    logger.info({ msg: "handleMessage - finalizing stream", sessionKey });
+    await stream.finalize();
     streams.delete(sessionKey);
-    
+    logger.info({ msg: "handleMessage - stream finalized and removed", sessionKey });
+
+    // Append usage stats if enabled
     const usage = state.usageMode !== "off" ? `\n\n_Usage: ${state.messageCount} messages_` : "";
-    if (usage && streamState.currentMsg.discordMsg) {
-      await streamState.currentMsg.discordMsg.edit(streamState.currentMsg.discordMsg.content + usage);
+    const lastMsg = stream.getLastMessage();
+    logger.debug({ msg: "handleMessage - appending usage", sessionKey, hasLastMsg: !!lastMsg, usageLen: usage.length });
+    if (usage && lastMsg) {
+      try {
+        await lastMsg.edit(lastMsg.content + usage);
+      } catch (e) {
+        logger.debug({ msg: "handleMessage - usage edit failed", sessionKey, error: String(e) });
+      }
     }
-    
-    try { 
+
+    try {
       const ackEmoji = getAckReaction();
-      await message.reactions.cache.get(ackEmoji)?.users.remove(client.user.id); 
-      await message.react("✅"); 
+      await message.reactions.cache.get(ackEmoji)?.users.remove(client.user.id);
+      await message.react("✅");
     } catch (e) {}
+    logger.info({ msg: "handleMessage - complete success", sessionKey });
   } catch (error: any) {
-    logger.error({ msg: "Inject failed", error: String(error) });
-    if (streamState.finalizeTimer) clearTimeout(streamState.finalizeTimer);
+    logger.error({ msg: "handleMessage - inject failed", sessionKey, error: String(error) });
+    await stream.finalize();
     streams.delete(sessionKey);
-    try { 
+    try {
       const ackEmoji = getAckReaction();
-      await message.reactions.cache.get(ackEmoji)?.users.remove(client.user.id); 
-      await message.react("❌"); 
+      await message.reactions.cache.get(ackEmoji)?.users.remove(client.user.id);
+      await message.react("❌");
     } catch (e) {}
     await message.reply("Error processing your request.");
   }
