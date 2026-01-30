@@ -89,6 +89,8 @@ export interface WOPRPluginContext {
   // Provider/model management
   getProviders?: () => Promise<ProviderInfo[]>;
   setSessionProvider?: (session: string, provider: string, options?: { model?: string }) => Promise<void>;
+  // Cancel an in-progress injection for a session
+  cancelInject?: (session: string) => boolean;
 }
 
 export interface WOPRPlugin {

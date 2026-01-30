@@ -112,6 +112,9 @@ const commands = [
     .setName("help")
     .setDescription("Show available commands and help"),
   new SlashCommandBuilder()
+    .setName("cancel")
+    .setDescription("Cancel the current AI response in progress"),
+  new SlashCommandBuilder()
     .setName("model")
     .setDescription("Switch the AI model for this session")
     .addStringOption(option =>
@@ -786,12 +789,43 @@ async function handleSlashCommand(interaction: ChatInputCommandInteraction) {
           `**/verbose <on/off>** - Toggle verbose mode\n` +
           `**/usage <mode>** - Set usage tracking (off/tokens/full)\n` +
           `**/model <model>** - Switch AI model (sonnet/opus/haiku)\n` +
+          `**/cancel** - Stop the current AI response\n` +
           `**/session <name>** - Switch to named session\n` +
           `**/wopr <message>** - Send message to WOPR\n` +
           `**/help** - Show this help\n\n` +
           `You can also mention me (@${client.user?.username}) to chat!`,
         ephemeral: true
       });
+      break;
+    }
+
+    case "cancel": {
+      const existingStream = streams.get(sessionKey);
+
+      // Try to cancel the injection via WOPR
+      let cancelled = false;
+      if (ctx.cancelInject) {
+        cancelled = ctx.cancelInject(sessionKey);
+      }
+
+      // Finalize and clean up the stream
+      if (existingStream) {
+        logger.info({ msg: "Cancel command - finalizing stream", sessionKey });
+        await existingStream.finalize();
+        streams.delete(sessionKey);
+      }
+
+      if (cancelled || existingStream) {
+        await interaction.reply({
+          content: "⏹️ **Cancelled**\n\nThe current response has been stopped.",
+          ephemeral: false
+        });
+      } else {
+        await interaction.reply({
+          content: "ℹ️ **Nothing to cancel**\n\nNo response is currently in progress.",
+          ephemeral: true
+        });
+      }
       break;
     }
 
